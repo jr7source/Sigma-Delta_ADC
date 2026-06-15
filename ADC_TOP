@@ -1,115 +1,170 @@
 //////////////////////////////////////////////////////////////////////////////////
-// Engineer: Jatin Ramchandani
-// 
-// Design Name: SIGMA-DELTA LVDS ADC
-// Module Name: top
+// Author    : Jatin Ramchandani
+//
+// Design Name : SIGMA-DELTA LVDS ADC 8-bit/10-bit
+// Module Name : adc
+//
+// Description : First-order sigma-delta front-end with a two-stage decimator.
+//               Stage 1 : counts the 1-density of the modulator bitstream over
+//                         2**ADC_WIDTH oversamples  -> one ADC_WIDTH-bit sample.
+//               Stage 2 : boxcar (moving-average) low-pass over 2**LPF_DEPTH_BITS
+//                         stage-1 samples           -> final filtered output.
+//
+// Notes       : - Single clock domain. Decimation is sequenced with clock-enable
+//                 strobes (accum_valid_flag, lpf_valid), NOT gated/divided clocks.
+//               - All state is initialised through the asynchronous rst_N; no flop
+//                 power-on init values are used (FPGA & ASIC-friendly).
 //////////////////////////////////////////////////////////////////////////////////
+`default_nettype none
 
-module top #(
-    parameter ADC_WIDTH        = 10,
-    parameter ACCUM_BITS       = 12,
-    parameter LPF_DEPTH_BITS   = 3,
-    parameter INPUT_TOPOLOGY   = "DIRECT"
-)(  
-    input  wire clk,
-    input  wire rst_N,
-    input  wire lvds_Analog_in_P,
-    input  wire lvds_PWM_in_N,
-    output wire analog_out,
-    output wire [ADC_WIDTH-1:0] digital_out,
-    output wire sample_rdy,
+module adc #(
+    parameter int    ADC_WIDTH      = 10,
+    parameter int    ACCUM_BITS     = 12,
+    parameter int    LPF_DEPTH_BITS = 3,
+    parameter string INPUT_TOPOLOGY = "DIRECT"
+)(
+    input  wire                                clk,
+    input  wire                                rst_N,
 
-    // Debugging signals
-    output wire debug_gamma,
+    // LVDS front-end
+    input  wire                                lvds_Analog_in_P,
+    input  wire                                lvds_PWM_in_N,
+
+    // Primary outputs
+    output wire                                analog_out,
+    output wire [ADC_WIDTH-1:0]                digital_out,
+    output wire                                sample_rdy,
+
+    // Debug observability
+    output wire                                debug_gamma,
     output wire [ADC_WIDTH+LPF_DEPTH_BITS-1:0] debug_accum,
-    output wire [ACCUM_BITS-1:0] debug_sample_count,
-    output wire [ADC_WIDTH-1:0] debug_avg,
-    output wire debug_accum_valid,
-    output wire [12:0] debug_movin_sum,
-    output wire [LPF_DEPTH_BITS-1:0] debug_lpf_count,
-    output wire [ADC_WIDTH-1:0] debug_lpf_memory,
-    output wire debug_lpf_valid
+    output wire [ACCUM_BITS-1:0]               debug_sample_count,
+    output wire [ADC_WIDTH-1:0]                debug_avg,
+    output wire                                debug_accum_valid,
+    output wire [ADC_WIDTH+LPF_DEPTH_BITS-1:0] debug_movin_sum,
+    output wire [LPF_DEPTH_BITS-1:0]           debug_lpf_count,
+    output wire [ADC_WIDTH-1:0]                debug_lpf_memory,
+    output wire                                debug_lpf_valid
 );
 
-    wire LVDS_comparator_output;
-    assign LVDS_comparator_output = lvds_Analog_in_P;
+    // -----------------------------------------------------------------------
+    // Local parameters
+    // -----------------------------------------------------------------------
+    localparam int OSR      = 2**ADC_WIDTH;       // stage-1 oversample count
+    localparam int LPF_TAPS = 2**LPF_DEPTH_BITS;  // stage-2 average length
+    localparam int SUM_BITS = ADC_WIDTH + LPF_DEPTH_BITS;
 
-    wire clk_S;
-    reg gamma;
-    always @(posedge clk_S or negedge rst_N)
+    // =======================================================================
+    // LVDS comparator front-end (digital model of the analog receiver)
+    //   DIRECT : take the resolved analog-path bit (P line)
+    //   else   : take the PWM-path bit (N line)
+    // =======================================================================
+    logic comparator_out;
+    generate
+        if (INPUT_TOPOLOGY == "DIRECT")
+            assign comparator_out = lvds_Analog_in_P;
+        else
+            assign comparator_out = lvds_PWM_in_N;
+    endgenerate
+
+    // =======================================================================
+    // Modulator sample register (gamma) - the 1-bit sigma-delta bitstream
+    // =======================================================================
+    logic gamma;
+    always_ff @(posedge clk or negedge rst_N)
         if (!rst_N) gamma <= 1'b0;
-        else gamma <= LVDS_comparator_output;
+        else        gamma <= comparator_out;
 
     assign analog_out = gamma;
 
-    wire clk_ACCUM;
-    reg [ADC_WIDTH+LPF_DEPTH_BITS-1:0] accum = 0;
-    reg [ACCUM_BITS-1:0] sample_count = 0;
-    reg [ACCUM_BITS-1:0] avg = 0;
-    reg accum_valid_flag = 0;
+    // =======================================================================
+    // Stage 1 : 1-density accumulator / decimator
+    //   Counts the ones in gamma over OSR oversamples and emits the count as
+    //   one ADC_WIDTH-bit sample, saturating the full-scale (all-ones) case.
+    // =======================================================================
+    logic [SUM_BITS-1:0]   accum;
+    logic [ACCUM_BITS-1:0] sample_count;
+    logic [ADC_WIDTH-1:0]  avg;
+    logic                  accum_valid_flag;
 
-    always @(posedge clk_ACCUM or negedge rst_N) begin
+    // Ones-count of the window closing this cycle (0 .. OSR), incl. current sample
+    logic [ADC_WIDTH:0] window_count;
+    assign window_count = accum[ADC_WIDTH-1:0] + gamma;
+
+    always_ff @(posedge clk or negedge rst_N) begin
         if (!rst_N) begin
-            accum <= 0;
-            sample_count <= 0;
-            avg <= 0;
-            accum_valid_flag <= 0;
+            accum            <= '0;
+            sample_count     <= '0;
+            avg              <= '0;
+            accum_valid_flag <= 1'b0;
         end else begin
-            case (sample_count)
-                0: accum <= gamma;
-                default: accum <= accum + gamma;
-            endcase
-            sample_count <= sample_count + 1;
+            // Accumulate; reload (not add) on the first sample of a window.
+            accum        <= (sample_count == '0) ? SUM_BITS'(gamma)
+                                                 : accum + gamma;
+            sample_count <= sample_count + 1'b1;
 
-            if (sample_count == ((2**ADC_WIDTH) - 1)) begin
-                avg <= accum/ACCUM_BITS;
-                sample_count <= 0;
-                accum_valid_flag <= 1;
+            if (sample_count == ACCUM_BITS'(OSR-1)) begin
+                // Include the current sample, then saturate OSR -> all-ones.
+                avg              <= window_count[ADC_WIDTH] ? {ADC_WIDTH{1'b1}}
+                                                           : window_count[ADC_WIDTH-1:0];
+                sample_count     <= '0;
+                accum_valid_flag <= 1'b1;
             end else begin
-                accum_valid_flag <= 0;
+                accum_valid_flag <= 1'b0;
             end
         end
     end
 
-    wire clk_LPF;
-    reg [12:0] movin_sum = 0;
-    reg [LPF_DEPTH_BITS-1:0] lpf_count = 0;
-    reg [ADC_WIDTH-1:0] lpf_memory = 0;
-    reg lpf_valid = 0;
+    // =======================================================================
+    // Stage 2 : boxcar moving-average low-pass / decimator
+    //   Averages LPF_TAPS stage-1 samples (divide by power of two = shift).
+    // =======================================================================
+    logic [SUM_BITS-1:0]       movin_sum;
+    logic [LPF_DEPTH_BITS-1:0] lpf_count;
+    logic [ADC_WIDTH-1:0]      lpf_memory;
+    logic                      lpf_valid;
 
-    always @(posedge clk_LPF or negedge rst_N) begin
+    always_ff @(posedge clk or negedge rst_N) begin
         if (!rst_N) begin
-            movin_sum <= 0;
-            lpf_count <= 0;
-            lpf_memory <= 0;
-            lpf_valid <= 0;
+            movin_sum  <= '0;
+            lpf_count  <= '0;
+            lpf_memory <= '0;
+            lpf_valid  <= 1'b0;
         end else if (accum_valid_flag) begin
             movin_sum <= movin_sum + avg;
-            lpf_count <= lpf_count + 1;
-            if (lpf_count == (2**LPF_DEPTH_BITS - 1)) begin
-                lpf_memory <= movin_sum >> LPF_DEPTH_BITS;
-                lpf_valid <= 1;
-                movin_sum <= 0;
-                lpf_count <= 0;
+            lpf_count <= lpf_count + 1'b1;
+
+            if (lpf_count == LPF_DEPTH_BITS'(LPF_TAPS-1)) begin
+                // Include the current sample in the average.
+                lpf_memory <= (movin_sum + avg) >> LPF_DEPTH_BITS;
+                lpf_valid  <= 1'b1;
+                movin_sum  <= '0;
+                lpf_count  <= '0;
             end else begin
-                lpf_valid <= 0;
+                lpf_valid  <= 1'b0;
             end
+        end else begin
+            lpf_valid <= 1'b0;   // keep sample_rdy a single-tick strobe
         end
     end
 
-    assign digital_out = lpf_valid ? lpf_memory : {ADC_WIDTH{1'b0}};
-    assign sample_rdy = lpf_valid;
+    // =======================================================================
+    // Output stage - hold the last conversion; sample_rdy pulses on update.
+    // =======================================================================
+    assign digital_out = lpf_memory;
+    assign sample_rdy  = lpf_valid;
 
-    // Debug assignments for functional debugging
-    assign debug_gamma = gamma;
-    assign debug_accum = accum;
+    // Debug observability
+    assign debug_gamma        = gamma;
+    assign debug_accum        = accum;
     assign debug_sample_count = sample_count;
-    assign debug_avg = avg;
-    assign debug_accum_valid = accum_valid_flag;
-    assign debug_movin_sum = movin_sum;
-    assign debug_lpf_count = lpf_count;
-    assign debug_lpf_memory = lpf_memory;
-    assign debug_lpf_valid = lpf_valid;
+    assign debug_avg          = avg;
+    assign debug_accum_valid  = accum_valid_flag;
+    assign debug_movin_sum    = movin_sum;
+    assign debug_lpf_count    = lpf_count;
+    assign debug_lpf_memory   = lpf_memory;
+    assign debug_lpf_valid    = lpf_valid;
 
 endmodule
 
+`default_nettype wire
